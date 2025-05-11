@@ -3,11 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"os"
+	"reflect"
 	"strings"
+	"time"
 
 	"github.com/doug-martin/goqu/v9"
 	_ "github.com/doug-martin/goqu/v9/dialect/postgres"
@@ -89,6 +92,12 @@ func clampInt64ToInt32(value int64) int32 {
 	return int32(value)
 }
 
+// Helper: is the timestamp valid for Postgres?
+func isValidPostgresTime(t time.Time) bool {
+	// Postgres can't handle times before year 0001
+	return t.Year() >= 1
+}
+
 func migrate(connector string, dbpath string) error {
 	const batchSize = 1000
 
@@ -102,7 +111,21 @@ func migrate(connector string, dbpath string) error {
 		return fmt.Errorf("failed to open db: %w", err)
 	}
 
+	// TODO: Check schema_migrations table for version
+	// TODO: Call rollback if error
+
 	ctx := context.Background()
+
+	stxn, err := sourceDB.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("source begin tx: %w", err)
+	}
+
+	dtxn, err := destDB.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("dest begin tx: %w", err)
+	}
+
 	for _, table := range []string{
 		"blobs",
 		"files",
@@ -161,11 +184,6 @@ func migrate(connector string, dbpath string) error {
 
 			// Fetch
 			{
-				txn, err := sourceDB.BeginTxx(ctx, nil)
-				if err != nil {
-					return fmt.Errorf("source begin tx: %w", err)
-				}
-
 				goquTable := goqu.I(table)
 				q := anon_dialect.From(goquTable).Select(goquTable.All()).Limit(uint(batchSize)).Offset(uint(offset))
 				sql, args, err := q.ToSQL()
@@ -173,7 +191,7 @@ func migrate(connector string, dbpath string) error {
 					return fmt.Errorf("source failed tosql: %w", err)
 				}
 
-				r, err := txn.QueryxContext(ctx, sql, args...)
+				r, err := stxn.QueryxContext(ctx, sql, args...)
 				if err != nil {
 					return fmt.Errorf("query `%s` [%v]: %w", sql, args, err)
 				}
@@ -193,16 +211,64 @@ func migrate(connector string, dbpath string) error {
 
 			// Insert
 			{
-				txn, err := destDB.BeginTxx(ctx, nil)
-				if err != nil {
-					return fmt.Errorf("dest begin tx: %w", err)
-				}
-
 				// Hotfix the funspeed generator
 				if table == "video_files" {
 					for idx := range rowsSlice {
 						if v, ok := rowsSlice[idx]["interactive_speed"].(int64); ok {
 							rowsSlice[idx]["interactive_speed"] = clampInt64ToInt32(v)
+						}
+					}
+				}
+				if table == "performer_custom_fields" {
+					for idx := range rowsSlice {
+						rowsSlice[idx]["type"] = reflect.TypeOf(rowsSlice[idx]["value"]).String()
+					}
+				}
+				if table == "saved_filters" {
+					validRows := make([]map[string]interface{}, 0, len(rowsSlice))
+
+					for _, row := range rowsSlice {
+						valid := true
+						for _, obj := range []string{"find_filter", "object_filter", "ui_options"} {
+							if strVal, ok := row[obj].(string); ok {
+								var tmp interface{}
+								err := json.Unmarshal([]byte(strVal), &tmp)
+								if err != nil {
+									log.Printf("Skipping row due to invalid JSON in %s: %v\nData: %s\n", obj, err, strVal)
+									valid = false
+									break // stop checking this row
+								}
+							}
+						}
+						if valid {
+							validRows = append(validRows, row)
+						}
+					}
+					rowsSlice = validRows // overwrite with only valid rows
+				}
+				if table == "scene_markers" {
+					for _, row := range rowsSlice {
+						for _, tsKey := range []string{"created_at", "updated_at"} {
+							if val, ok := row[tsKey]; ok {
+								switch v := val.(type) {
+								case string:
+									t, err := time.Parse(time.RFC3339, v)
+									if err != nil || !isValidPostgresTime(t) {
+										log.Printf("Invalid time for %s: %v — using time.Now()", tsKey, val)
+										row[tsKey] = time.Now().UTC()
+									} else {
+										row[tsKey] = t
+									}
+								case time.Time:
+									if !isValidPostgresTime(v) {
+										log.Printf("Out-of-range time for %s: %v — using time.Now()", tsKey, v)
+										row[tsKey] = time.Now().UTC()
+									}
+								default:
+									log.Printf("Unrecognized time format for %s: %v — using time.Now()", tsKey, val)
+									row[tsKey] = time.Now().UTC()
+								}
+							}
 						}
 					}
 				}
@@ -213,23 +279,15 @@ func migrate(connector string, dbpath string) error {
 					return fmt.Errorf("failed tosql: %w", err)
 				}
 
-				_, err = txn.ExecContext(ctx, sql, args...)
+				_, err = dtxn.ExecContext(ctx, sql, args...)
 				if err != nil {
 					return fmt.Errorf("exec `%s` [%v]: %w", sql, args, err)
-				}
-
-				if err := txn.Commit(); err != nil {
-					return fmt.Errorf("commit: %w", err)
 				}
 			}
 
 			// Move to the next batch
 			offset += batchSize
 		}
-	}
-
-	if err := sourceDB.Close(); err != nil {
-		return fmt.Errorf("source close: %w", err)
 	}
 
 	fmt.Printf("Setting sequences...\n")
@@ -239,21 +297,20 @@ func migrate(connector string, dbpath string) error {
 		"saved_filters", "scene_markers",
 		"scenes", "studios", "tags",
 	} {
-		txn, err := destDB.BeginTxx(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("dest begin tx: %w", err)
-		}
-
 		sql := fmt.Sprintf(restart_seq, table_name)
 
-		_, err = txn.QueryxContext(ctx, sql)
+		_, err = dtxn.ExecContext(ctx, sql)
 		if err != nil {
 			return fmt.Errorf("exec `%s`: %w", sql, err)
 		}
+	}
 
-		if err := txn.Commit(); err != nil {
-			return fmt.Errorf("commit: %w", err)
-		}
+	if err := dtxn.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+
+	if err := sourceDB.Close(); err != nil {
+		return fmt.Errorf("source close: %w", err)
 	}
 
 	if err := destDB.Close(); err != nil {
